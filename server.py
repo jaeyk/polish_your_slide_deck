@@ -1,4 +1,5 @@
 from pathlib import Path
+from copy import deepcopy
 import io
 import math
 import re
@@ -66,6 +67,8 @@ BODY_MIN_PT = 24
 LABEL_MIN_PT = 18
 # Title placeholders this long are really captions, so they get the body floor.
 CAPTION_TITLE_MIN_WORDS = 12
+# ...as are title placeholders whose author-set text is all smaller than this.
+CAPTION_TITLE_MAX_PT = 24
 MIN_CONTRAST = 7.0
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 # Pictures with more transparent area than this get a white plate behind them,
@@ -130,7 +133,17 @@ def _text_role(shape):
     } or re.match(r"(source|note)s?\s*:", text, re.IGNORECASE):
         return "label"
     if placeholder_type in {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE}:
-        return "caption" if len(text.split()) >= CAPTION_TITLE_MIN_WORDS else "title"
+        # A title placeholder the author set small, or filled with a sentence,
+        # is a caption: it gets the body floor instead of the title floor.
+        sizes = [
+            run.font.size.pt
+            for paragraph in shape.text_frame.paragraphs
+            for run in paragraph.runs
+            if run.font.size is not None and run.text.strip()
+        ]
+        if (sizes and max(sizes) < CAPTION_TITLE_MAX_PT) or len(text.split()) >= CAPTION_TITLE_MIN_WORDS:
+            return "caption"
+        return "title"
     if placeholder_type == PP_PLACEHOLDER.SUBTITLE:
         return "subtitle"
     return "body"
@@ -461,6 +474,125 @@ def _parse_markdown_edits(markdown):
     return slides
 
 
+_MARKERS = {(True, True): "***", (True, False): "**", (False, True): "*"}
+
+
+def _explicit_flags(rPr):
+    if rPr is None:
+        return False, False
+    return rPr.get("b") in ("1", "true"), rPr.get("i") in ("1", "true")
+
+
+def _paragraph_markdown(p):
+    """One paragraph as text with **bold** / *italic* markers; line breaks become \\v."""
+    segments = []  # [text, flags] or the line-break sentinel None
+    for child in p:
+        if child.tag == qn("a:br"):
+            segments.append(None)
+        elif child.tag in (qn("a:r"), qn("a:fld")):
+            text = (child.findtext(qn("a:t")) or "").replace("*", "\\*")
+            flags = _explicit_flags(child.find(qn("a:rPr")))
+            previous = segments[-1] if segments else None
+            if previous is not None and (previous[1] == flags or not text.strip()):
+                previous[0] += text
+            else:
+                segments.append([text, flags])
+    parts = []
+    for segment in segments:
+        if segment is None:
+            parts.append("\v")
+            continue
+        text, flags = segment
+        marker = _MARKERS.get(flags)
+        core = text.strip()
+        if not marker or not core:
+            parts.append(text)
+            continue
+        lead = text[: len(text) - len(text.lstrip())]
+        trail = text[len(text.rstrip()) :]
+        parts.append(f"{lead}{marker}{core}{marker}{trail}")
+    return "".join(parts)
+
+
+def _shape_markdown(shape):
+    return "\n".join(_paragraph_markdown(p) for p in shape.text_frame._txBody.findall(qn("a:p")))
+
+
+def _parse_inline(text):
+    """Split marked-up text into (text, bold, italic) segments."""
+    bold = italic = False
+    buffer = ""
+    segments = []
+    for token in re.split(r"(\\\*|\*{1,3})", text):
+        if token == "\\*":
+            buffer += "*"
+        elif token in ("*", "**", "***"):
+            if buffer:
+                segments.append((buffer, bold, italic))
+                buffer = ""
+            bold = not bold if token in ("**", "***") else bold
+            italic = not italic if token in ("*", "***") else italic
+        else:
+            buffer += token
+    if buffer:
+        segments.append((buffer, bold, italic))
+    return segments
+
+
+def _write_markdown_text(shape, text):
+    """Replace a shape's text while keeping each paragraph's formatting.
+
+    Paragraph properties (bullets, spacing) and the first run's character
+    properties (size, color) are reused by position; **bold** and *italic*
+    markers set emphasis. Hyperlinks are not carried over to rewritten text.
+    """
+    body = shape.text_frame._txBody
+    old = body.findall(qn("a:p"))
+    templates = []
+    for p in old:
+        first_run = next((c for c in p if c.tag in (qn("a:r"), qn("a:fld"))), None)
+        templates.append(
+            (
+                p.find(qn("a:pPr")),
+                first_run.find(qn("a:rPr")) if first_run is not None else None,
+                p.find(qn("a:endParaRPr")),
+            )
+        )
+    fallback_rPr = next((t[1] for t in templates if t[1] is not None), None)
+    for p in old:
+        body.remove(p)
+    for index, line in enumerate(text.split("\n")):
+        pPr, rPr, end = templates[min(index, len(templates) - 1)] if templates else (None, None, None)
+        rPr = rPr if rPr is not None else fallback_rPr
+        p = body.makeelement(qn("a:p"), {})
+        body.append(p)
+        if pPr is not None:
+            p.append(deepcopy(pPr))
+        for piece_index, piece in enumerate(line.split("\v")):
+            if piece_index:
+                br = p.makeelement(qn("a:br"), {})
+                if rPr is not None:
+                    br.append(deepcopy(rPr))
+                p.append(br)
+            for segment, bold, italic in _parse_inline(piece):
+                run = p.makeelement(qn("a:r"), {})
+                run_rPr = deepcopy(rPr) if rPr is not None else run.makeelement(qn("a:rPr"), {"lang": "en-US"})
+                for link in run_rPr.findall(qn("a:hlinkClick")):
+                    run_rPr.remove(link)
+                for attribute, on in (("b", bold), ("i", italic)):
+                    if on:
+                        run_rPr.set(attribute, "1")
+                    elif attribute in run_rPr.attrib:
+                        run_rPr.set(attribute, "0")
+                run.append(run_rPr)
+                t = run.makeelement(qn("a:t"), {})
+                t.text = segment
+                run.append(t)
+                p.append(run)
+        if end is not None:
+            p.append(deepcopy(end))
+
+
 def _apply_markdown_edits(presentation, markdown_path):
     edits = _parse_markdown_edits(markdown_path.read_text(encoding="utf-8"))
     for slide_number, shape_edits in edits.items():
@@ -476,8 +608,12 @@ def _apply_markdown_edits(presentation, markdown_path):
                 )
             # Rewriting text drops run formatting and fields (e.g. slide numbers),
             # so only touch shapes whose text actually changed.
-            if text != shape.text_frame.text.strip("\n"):
-                shape.text_frame.text = text
+            unchanged = {
+                shape.text_frame.text.strip("\n"),
+                _shape_markdown(shape).strip("\n"),
+            }
+            if text not in unchanged:
+                _write_markdown_text(shape, text)
 
 
 @mcp.tool()
@@ -514,7 +650,7 @@ def export_deck_to_markdown(filename: str) -> str:
             lines.append(
                 f"<!-- pptx-shape: {shape.shape_id}; role: {_role_for_shape(shape)} -->"
             )
-            lines.append(_escape_markdown_text(shape.text_frame.text))
+            lines.append(_escape_markdown_text(_shape_markdown(shape)))
             lines.append("")
     destination.write_text("\n".join(lines), encoding="utf-8")
     return f"Exported {len(presentation.slides)} slides to {destination.relative_to(ROOT)}"

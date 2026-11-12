@@ -229,6 +229,54 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(top, slide_height - bottom)  # optical lift: a bit above center
         self.assertLess(abs(top - (slide_height - bottom)), slide_height * 0.1)
 
+    def test_markdown_edit_keeps_bold_italic_bullets_and_size(self):
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(3))
+        frame = box.text_frame
+        frame.text = "Intro line"
+        paragraph = frame.add_paragraph()
+        for text, bold, italic in [("Learning Cost", True, False), (" → ", False, False), ("I want", False, True), (" (too hard)", False, False)]:
+            run = paragraph.add_run()
+            run.text = text
+            run.font.size = Pt(28)
+            run.font.bold = bold
+            run.font.italic = italic
+        bullet = paragraph._p.get_or_add_pPr()
+        bullet.set("marL", "457200")
+        bullet.append(bullet.makeelement(qn("a:buChar"), {"char": "•"}))
+        presentation.save(self.data_directory / "fmt.pptx")
+
+        server.export_deck_to_markdown("fmt.pptx")
+        markdown_path = self.output_directory / "fmt.md"
+        markdown = markdown_path.read_text(encoding="utf-8")
+        self.assertIn("**Learning Cost** → *I want* (too hard)", markdown)
+        markdown_path.write_text(markdown.replace(" (too hard)", ""), encoding="utf-8")
+        server.apply_markdown_edits("fmt.pptx")
+
+        edited = Presentation(self.output_directory / "fmt-edited.pptx")
+        paragraph = edited.slides[0].shapes[0].text_frame.paragraphs[1]
+        self.assertEqual(paragraph.text, "Learning Cost → I want")
+        runs = {run.text: run for run in paragraph.runs}
+        self.assertTrue(runs["Learning Cost"].font.bold)
+        self.assertTrue(runs["I want"].font.italic)
+        self.assertFalse(runs[" → "].font.bold)
+        self.assertEqual(runs["I want"].font.size, Pt(28))
+        self.assertIsNotNone(paragraph._p.find(qn("a:pPr")).find(qn("a:buChar")))
+
+    def test_small_title_placeholder_is_a_caption(self):
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+        slide.shapes.title.text = "Photos by me, 2026."
+        slide.shapes.title.text_frame.paragraphs[0].runs[0].font.size = Pt(20)
+        presentation.save(self.data_directory / "caption.pptx")
+
+        server.polish_deck("caption.pptx")
+
+        polished = Presentation(self.output_directory / "caption-polished.pptx")
+        run = polished.slides[0].shapes.title.text_frame.paragraphs[0].runs[0]
+        self.assertEqual(run.font.size, Pt(24))
+
     def test_design_preferences_are_served(self):
         (self.root / "design-preferences.md").write_text("# Design Preferences\nLarge type.", encoding="utf-8")
         with patch.object(server, "PREFERENCES_PATH", self.root / "design-preferences.md"):
